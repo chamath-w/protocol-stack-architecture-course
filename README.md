@@ -20,6 +20,8 @@ Everything in this repository is **offline**. No network is required after you d
 
 Open `html/index.html` in any browser (Chrome, Firefox, Edge, Safari). Animations use inline Scalable Vector Graphics and Cascading Style Sheets only — no external scripts or fonts from the internet.
 
+Online mirror (when you have connectivity): https://chamath-w.github.io/protocol-stack-architecture-course/
+
 ## Course map
 
 1. Why protocol stacks exist, and what a translation service does
