@@ -96,6 +96,8 @@ A translator has **two stacks plus a middle**:
                                 └────────────────────────┘
 ```
 
+The **canonical core** is your product’s protocol-independent process image (values, quality, time, mapping, policy). Prefer it over pairwise byte bridges so you do not grow N² converters as protocols are added. Deep dive: [Chapter 10](10-translation-service.md).
+
 **Do not** let Stack A’s frame types appear in Stack B’s modules. Convert at the canonical boundary only.
 
 Suggested core modules for a translator:

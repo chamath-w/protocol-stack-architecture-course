@@ -14,7 +14,7 @@ Everything in this repository is **offline**. No network is required after you d
 
 | Format | Path | Best for |
 |--------|------|----------|
-| **Interactive HTML** | [`html/index.html`](html/index.html) | Visual learning — animated diagrams, chapter navigation |
+| **Interactive HTML** | [`html/index.html`](html/index.html) | Visual learning — animated diagrams, **step-by-step parse lab**, chapter navigation |
 | **Full Markdown course** | [`markdown/COURSE.md`](markdown/COURSE.md) | Reading / annotating / printing |
 | **Chapter files** | [`markdown/chapters/`](markdown/chapters/) | Studying one topic at a time |
 

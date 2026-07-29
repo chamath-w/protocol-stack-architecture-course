@@ -1,6 +1,6 @@
 # Protocol Stack Architecture Course
 
-**Self-contained study guide for airplane use.** Open the companion HTML at `html/index.html` for animated diagrams.
+**Self-contained study guide for airplane use.** Open the companion HTML at `html/index.html` for animated diagrams and the interactive parse lab.
 
 Analyzed implementations: **rodbus** (Modbus), **dnp3** (Distributed Network Protocol 3), **libIEC61850** (International Electrotechnical Commission 61850).
 
@@ -310,6 +310,8 @@ A translator has **two stacks plus a middle**:
                                 └────────────────────────┘
 ```
 
+The **canonical core** is your product’s protocol-independent process image (values, quality, time, mapping, policy). Prefer it over pairwise byte bridges so you do not grow N² converters as protocols are added. Deep dive: [Chapter 10](10-translation-service.md).
+
 **Do not** let Stack A’s frame types appear in Stack B’s modules. Convert at the canonical boundary only.
 
 Suggested core modules for a translator:
@@ -371,208 +373,304 @@ Order that works well:
 ---
 
 
-# Chapter 4 — Parsing Payloads: State Machines and Friends
+# Chapter 4 — Parsing Payloads: Strategies in Depth
 
-Parsing industrial protocols is mostly about **turning a stream of bytes into structured messages without allocating blindly or trusting the peer**. This chapter compares the mechanisms you will actually use.
+Parsing industrial protocols is mostly about **turning a stream of bytes into structured messages without allocating blindly or trusting the peer**. This chapter catalogs the options, when each wins or loses, and how the stacks in this folder chose.
 
 ## The four jobs of a parser
 
+Every framer and codec is doing some mix of:
+
 1. **Synchronize** — find where a message starts
 2. **Delimit** — know where it ends
-3. **Validate** — checksums, lengths, protocol identifiers
-4. **Interpret** — map bytes to typed fields
+3. **Validate** — checksums, lengths, protocol identifiers, version fields
+4. **Interpret** — map bytes to typed fields (function codes, registers, object headers, …)
 
-Different layers own different jobs. Link/frame layers do 1–3. Application layers do 4 (and more validation).
+| Job | Typical owner |
+|-----|----------------|
+| Synchronize / delimit / validate framing | Link or frame layer |
+| Interpret meaning | Application codec |
+| Reassemble multi-frame application messages | Transport layer (Distributed Network Protocol 3) |
 
-## Mechanism A — Incremental state machine (best for streams)
+Do not merge all four into one function. Framing bugs and semantic bugs need different tests.
 
-Used heavily in:
+---
 
-- **dnp3** link parser (`FindSync1` → `FindSync2` → `ReadHeader` → `ReadBody`)
-- **rodbus** Transmission Control Protocol header parser (`Begin` → `Header`)
-- **rodbus** Remote Terminal Unit parser (`Start` → length discovery → `ReadFullBody`)
-- **libIEC61850** Transport Packet reader (`WAITING` → `COMPLETE` / `ERROR`)
+## Strategy catalog (what exists)
 
-### Pattern
+### 1. Incremental state machine (streaming finite-state machine)
+
+**Idea:** Keep an explicit `state` enum. On each call, either consume bytes and advance, return “need more,” emit a frame, or error/reset.
+
+**Where you see it:** **dnp3** link (`FindSync1` → `FindSync2` → `ReadHeader` → `ReadBody`); **rodbus** Modbus Application Protocol and Remote Terminal Unit parsers; **libIEC61850** Transport Packet waiting states.
+
+**Best for:** Transmission Control Protocol streams, serial byte streams, any medium that delivers arbitrary chunks.
+
+**Worse for:** Already-delimited datagrams where you always get one whole message per read (still usable, just heavier than necessary).
+
+**Pros:** Natural partial reads; bounded memory; easy `reset()`; unit-testable with sliced input.  
+**Cons:** Many states; easy to miss an error path; off-by-one bugs in hand machines.
+
+**Hard rules:** Cap lengths before copying. Store only what the next state needs (parsed header + expected remaining count).
+
+---
+
+### 2. Length-prefixed framing
+
+**Idea:** A header field says how many bytes follow. Read header → clamp length → read body.
+
+**Example:** Modbus Application Protocol on Transmission Control Protocol — 16-bit length (includes unit identifier).
+
+**Best for:** Reliable bidirectional streams with an explicit length field in the standard.
+
+**Worse for:** Noisy serial where you might join mid-frame (no sync to recover); untrusted peers without a hard maximum.
+
+**Pros:** Fast; no sync hunt; simple state machine (`Begin` → `Header`).  
+**Cons:** Corrupted length can request gigabytes — **must clamp**; alone cannot resync on serial.
+
+**Verdict:** Default choice for modern Transmission Control Protocol industrial coats. Pair with fail-closed on bad lengths.
+
+---
+
+### 3. Sync-byte hunt + integrity check
+
+**Idea:** Search for magic start bytes, parse a header, verify cyclic redundancy check (or similar) over header and/or body. On failure, discard and hunt again (fail soft) or close (fail closed).
+
+**Examples:** Distributed Network Protocol 3 link (`0x05 0x64` + cyclic redundancy check blocks); many serial protocols.
+
+**Best for:** Serial lines, radio, anything with noise or mid-stream attach.
+
+**Worse for:** Pure Transmission Control Protocol where length-prefix already delimits — unless the standard mandates sync for compatibility (Distributed Network Protocol 3 still uses it over Transmission Control Protocol).
+
+**Pros:** Recovers from garbage; detects corruption.  
+**Cons:** Sync pattern can appear inside payloads (false starts — checksum rejects); more central processing unit cost; policy choice (soft vs closed) must be explicit.
+
+**Verdict:** Prefer for serial. On Transmission Control Protocol, use it when the standard requires it; otherwise length-prefix is cleaner.
+
+---
+
+### 4. Function-code (or type-code) length tables
+
+**Idea:** After reading a small fixed prefix (address + function code), look up how long the rest of the frame must be. Different tables for requests vs responses.
+
+**Example:** **rodbus** Remote Terminal Unit receive path.
+
+**Best for:** Protocols with a closed set of fixed layouts (classic Modbus coils/registers).
+
+**Worse for:** Open-ended vendor function codes; variable-length fields that are not discoverable from the first bytes; standards that expect silence-based framing only.
+
+**Pros:** Deterministic without timing; works with asynchronous runtimes; no need to wait for 3.5 character silence on receive.  
+**Cons:** Unknown function code → cannot delimit → hard error; tables must stay complete.
+
+**Note:** **rodbus** still applies inter-frame delay on **transmit** for bus turnaround; receive delimiting is table-driven.
+
+**Verdict:** Excellent for Modbus-like serial when you control the function set. Poor as a general strategy for extensible protocols.
+
+---
+
+### 5. Inter-frame silence / idle-line detection
+
+**Idea:** A gap of N character times means “frame ended” (classic Modbus Remote Terminal Unit physical guidance).
+
+**Best for:** Hardware universal asynchronous receiver-transmitters with idle detection; very low-level drivers.
+
+**Worse for:** Software asynchronous runtimes with jittery scheduling; virtual serial ports; high baud where gaps are tiny; mixed traffic with irregular spacing.
+
+**Pros:** Can delimit unknown layouts without a length table.  
+**Cons:** Fragile in software; false frame splits under load; hard to unit-test.
+
+**Verdict:** Prefer hardware support or use as a backup. For portable stacks, length tables or sync+length beat pure silence detection — which is why **rodbus** chose tables for receive.
+
+---
+
+### 6. Transport / segmentation assembly (first–final flags)
+
+**Idea:** Link frames are small; application messages are large. A transport header carries first flag, final flag, and sequence. Assembler states: empty → running → complete.
+
+**Example:** **dnp3** transport layer (about 249 application bytes per link frame).
+
+**Best for:** Standards that segment application fragments across multiple link frames.
+
+**Worse for:** Protocols whose application message always fits in one frame (Modbus). Adding this layer “just in case” adds bugs without benefit.
+
+**Pros:** Clear module boundary; sequence checking catches loss/reorder.  
+**Cons:** Another state machine; must handle peer change and overflow; duplicates/retries need session policy too.
+
+**Verdict:** Mandatory when the standard segments. Keep it **out of** the link parser and **out of** the application object decoder.
+
+---
+
+### 7. Zero-copy cursor interpretation
+
+**Idea:** Once a complete application buffer exists, walk it with a cursor: read integers, borrow slices, yield iterators — avoid allocating a vector per point.
+
+**Examples:** **rodbus** and **dnp3** application parse via `scursor`.
+
+**Best for:** High-rate polling, large measurement lists, same-language handlers that finish before the buffer is reused.
+
+**Worse for:** Storing decoded values past the handler call without copying; garbage-collected language bindings (often copy at the boundary anyway).
+
+**Pros:** Fast; low allocation; cache-friendly.  
+**Cons:** Lifetime discipline; harder debugging if you accidentally keep a dangling borrow (Rust prevents this; C does not).
+
+**Verdict:** Prefer for hot application decode in Rust/C++. Always copy when crossing into long-lived stores or foreign-function interfaces.
+
+---
+
+### 8. Schema-generated codecs (Abstract Syntax Notation One / similar)
+
+**Idea:** Compile a formal schema into encode/decode functions (often Basic Encoding Rules: tag, length, value).
+
+**Example:** **libIEC61850** Manufacturing Message Specification via asn1c; goose/sampled-value paths often hand-rolled for control.
+
+**Best for:** Huge message catalogs defined by standards bodies.
+
+**Worse for:** Tiny embedded footprints without trimming; teams that cannot review generated code; ultra-hot paths where allocation-heavy decode trees hurt.
+
+**Pros:** Faithfulness to the standard; less hand-written catalog bugs.  
+**Cons:** Bulk; opacity; security fixes in generator *and* hand helpers; possible heap churn.
+
+**Verdict:** Use for large ISO-style stacks. For latency-critical Ethernet snapshots, hand parsers with hard limits (as libIEC61850 does for goose) are often better.
+
+---
+
+### 9. Parser combinators / declarative grammars
+
+**Idea:** Compose small parsers (`nom`, `combine`, …) into a grammar.
+
+**Best for:** Prototypes, file formats, recursive structures with clear text/binary grammars.
+
+**Worse for:** Streaming partial input unless carefully designed; safety-certified hot paths where every transition must be auditable; no-alloc embedded.
+
+**Verdict:** None of the three production stacks studied here use combinators on the hot path. Prefer explicit state machines for industrial wire framing.
+
+---
+
+### 10. Datagram = one message (User Datagram Protocol / multicast)
+
+**Idea:** Each socket read is already one protocol data unit (or one link frame). Still validate length and checksum inside the datagram; do not span messages across datagrams unless the standard says so.
+
+**Example:** **dnp3** User Datagram Protocol mode (`LinkReadMode::Datagram`); IEC 61850 goose/sampled values on Ethernet.
+
+**Best for:** Multicast and datagram transports.
+
+**Worse for:** Assuming the same code path as Transmission Control Protocol streams without disabling multi-frame spanning.
+
+---
+
+## Decision matrix — pick by application
+
+| Application context | Prefer | Avoid / demote |
+|---------------------|--------|----------------|
+| Modbus over Transmission Control Protocol | Length-prefixed state machine + clamp | Sync hunt alone; silence detection |
+| Modbus over serial (known function set) | Function-code length table + cyclic redundancy check; fail soft on bad check | Pure silence delimiting in user-space async; unknown-FC open world |
+| Distributed Network Protocol 3 serial | Sync hunt + cyclic redundancy check, fail soft; then transport assembly; then cursor app parse | Collapsing all layers into one buffer scrape |
+| Distributed Network Protocol 3 Transmission Control Protocol | Same framing as standard; fail closed on link errors | Ignoring transport first/final flags |
+| IEC 61850 Manufacturing Message Specification | Schema Basic Encoding Rules for protocol data units; hand helpers for association pieces | Ad-hoc string splitting |
+| IEC 61850 goose / sampled values | Hand Basic Encoding Rules / fixed layouts with hard caps; datagram mindset | Full asn1c trees on every multicast packet if latency matters |
+| Protocol translator hot path | Zero-copy into canonical **copy** at the core boundary | Storing borrowed wire slices in the point store |
+| Safety / certification narrative | Explicit enums + tables you can review | Opaque combinator soup |
+| Hostile network (internet-facing gateway) | Fail closed, clamp all lengths, fuzz framers | Fail soft forever (hides attacks as “noise”) |
+| Lab bench / forgiving serial | Fail soft resync | Closing the port on every glitch |
+
+---
+
+## Layered parsing in practice (happy path)
 
 ```text
-state = START
-loop:
-  if not enough bytes for this state: return NeedMore
-  consume / validate
-  state = NEXT or emit Frame and state = START
+read() → append buffer
+framer.parse():
+  NeedMore → read again
+  Frame → transport.assemble(frame)   # if layer exists
+       → if complete fragment: app.decode(fragment)
+       → session.handle(message)
+  Error → reset and/or close
 ```
 
-### Pros
+**Application decode** should assume the fragment is already whole. Do not sync-hunt inside object headers.
 
-- Handles partial reads naturally
-- Constant memory if you bound frame size
-- Easy to reset after errors
-- Matches how Transmission Control Protocol and serial actually behave
+---
 
-### Cons
+## Fail soft versus fail closed (framing errors)
 
-- States proliferate for complex headers
-- Easy to forget a reset path
-- Hand-written machines need careful review for off-by-one bugs
+| Policy | Behavior | Good for | Bad for |
+|--------|----------|----------|---------|
+| Fail soft | Discard byte(s), return to sync hunt | Noisy serial | Masking malicious length games on Transmission Control Protocol |
+| Fail closed | Abort session, reconnect | Stream protocols; gateways | Flapping on a single serial glitch |
 
-### Best practice
+**dnp3** exposes this as link error mode (`Discard` vs `Close`). Choose per medium, not globally.
 
-Store only what the next state needs (for example, a parsed header and expected body length). Cap maximum length **before** allocating or copying into a body buffer.
+---
 
-## Mechanism B — Length-prefixed framing
+## Worked micro-examples
 
-The peer tells you the size.
-
-**Example:** Modbus Application Protocol header on Transmission Control Protocol — a 16-bit length field tells how many bytes follow (including unit identifier).
-
-### Pros
-
-- Simple, fast, no sync hunt
-- Works perfectly on reliable streams
-
-### Cons
-
-- Useless alone on raw serial (no “start of message” if you join mid-stream)
-- A corrupted length field can request absurd sizes — **must clamp**
-
-**rodbus** rejects lengths outside `(0, 254]` and requires protocol identifier zero.
-
-## Mechanism C — Sync hunt + cyclic redundancy check
-
-Used by Distributed Network Protocol 3 link layer (`0x05 0x64` start bytes, cyclic redundancy check every 16 bytes) and Modbus Remote Terminal Unit (cyclic redundancy check over address + protocol data unit).
-
-### Pros
-
-- Recovers from noise (with fail-soft policy)
-- Detects corruption
-
-### Cons
-
-- More central processing unit cost
-- Sync bytes can appear inside payloads (false starts) — checksum saves you
-- On Transmission Control Protocol, many stacks still keep sync/checksum for compatibility even though the stream is reliable
-
-## Mechanism D — Function-code-driven length tables
-
-**rodbus** Remote Terminal Unit does **not** primarily wait for 3.5 character times of silence to find frame ends on receive. Instead it:
-
-1. Reads unit identifier and function code
-2. Looks up how long that function’s body must be (different tables for requests versus responses)
-3. Reads that many bytes
-4. Checks the cyclic redundancy check
-
-### Pros
-
-- Deterministic in software without relying on timing jitter
-- Works well with asynchronous runtimes
-
-### Cons
-
-- Unknown function codes cannot be delimited → hard error
-- Custom or unusual function codes need table updates
-
-Silence/timing is still applied on **transmit** for bus turnaround (3.5 character times).
-
-## Mechanism E — Zero-copy cursor parsing
-
-After a complete application fragment exists in a buffer, **rodbus** and **dnp3** parse with a cursor (`scursor::ReadCursor`):
-
-- Read fixed-size integers
-- Borrow slices for sequences
-- Iterators yield measurements without allocating vectors per point
-
-### Pros
-
-- Fast, cache-friendly
-- Fewer heap surprises under load
-- Ideal for high-rate polling
-
-### Cons
-
-- Borrowed data lifetime tied to the buffer — do not store references past the handler call unless you copy
-- Harder for bindings in garbage-collected languages (often copy at the foreign-function interface boundary)
-
-## Mechanism F — Schema-generated codecs (Abstract Syntax Notation One)
-
-**libIEC61850** Manufacturing Message Specification messages use codecs generated from Abstract Syntax Notation One modules (asn1c), encoding with Basic Encoding Rules (tag, length, value).
-
-For Generic Object Oriented Substation Event and Sampled Values, the library often uses **hand-rolled** Basic Encoding Rules walkers for speed and control.
-
-### Pros
-
-- Faithful to large standards
-- Reduces hand-written protocol bugs for huge message catalogs
-
-### Cons
-
-- Generated code is bulky and opaque
-- Security review is harder; bugs appear in both generated and hand paths
-- Allocating full decode trees can be expensive — watch embedded budgets
-
-## Mechanism G — Parser combinators / declarative grammars
-
-Libraries like `nom` in Rust are popular in some ecosystems. **None of the three stacks studied here rely on them for the hot path.** They chose explicit state machines + cursors instead.
-
-### When combinators help
-
-- Quick prototypes
-- File formats with clear recursive structure
-
-### When they hurt
-
-- Streaming partial input (unless carefully designed)
-- Strict no-alloc environments
-- Teams that must audit every state transition for safety certification
-
-## Choosing a mechanism — decision table
-
-| Medium / problem | Prefer |
-|------------------|--------|
-| Transmission Control Protocol with explicit length | Length-prefixed state machine |
-| Noisy serial with known sync | Sync hunt + checksum, fail soft |
-| Serial Modbus-like known function layouts | Function-code length table + checksum |
-| Multi-segment application messages | Transport assembler state machine (see Distributed Network Protocol 3 first/final flags) |
-| Dense measurement lists | Zero-copy cursors over a completed fragment |
-| Huge structured standards | Schema-generated codecs + careful memory policy |
-| Multicast Ethernet snapshots | Hand parsers with hard size limits |
-
-## A reference frame-reader loop
-
-This is the shape shared by **rodbus** `FramedReader` and friends:
+### Length-prefixed (Modbus Application Protocol)
 
 ```text
-loop:
-  match parser.parse(buffer):
-    Ok(None) ->
-      read more bytes from physical layer into buffer
-      if read fails: return InputOutputError
-    Ok(Some(frame)) ->
-      return frame
-    Err(e) ->
-      parser.reset()
-      return e   # or discard-and-continue on serial fail-soft
+Bytes:  [00 01] [00 00] [00 06] [01] [03 00 00 00 0A]
+         tx id   proto   length  uid  function + data
+State:  Begin → need 7 header bytes → Header(len=6) → read 6 → Frame
+Check:  proto==0; length in (0,254]; body length = length-1 after uid accounting per stack rules
 ```
 
-Keep **parse** pure relative to the socket: it only consumes a buffer. That makes unit tests trivial (feed byte slices).
+### Sync hunt (Distributed Network Protocol 3 link start)
 
-## Application parsing tips
+```text
+Bytes:  ... aa 05 64 [header][crc] [body blocks][crc] ...
+State:  FindSync1 (wait 05) → FindSync2 (wait 64) → ReadHeader → ReadBody
+On bad crc: fail soft → FindSync1; or fail closed → tear down
+```
 
-1. **Expect emptiness** after fixed protocol data units — trailing garbage is an error.
-2. **Validate ranges early** (maximum registers per request, maximum fragment size).
-3. **Separate “bad frame” from “exception response”.** A Modbus illegal-function exception is valid framing; a bad cyclic redundancy check is not.
-4. **Log with layer tags.** Decode levels in **rodbus** / **dnp3** let you enable physical hex, frame headers, or application objects independently.
-5. **Fuzz the framer.** Partial headers, max-length frames, and truncated cyclic redundancy checks catch most production panics.
+### Function-code table (Remote Terminal Unit request)
 
-## State machine versus “just buffer until newline”
+```text
+Bytes:  [01] [03] [00 00 00 0A] [crc lo] [crc hi]
+         uid  FC   fixed-size body for FC 03 request
+State:  Start → read uid+FC → lookup request length → ReadFullBody → crc ok → Frame
+```
 
-Industrial protocols almost never use text delimiters. If you find yourself buffering until a magic character, stop and re-read the specification’s framing section. Binary length and checksums are the norm.
+### Transport assembly
+
+```text
+Frame1: FIR=1 FIN=0 seq=5  payload...
+Frame2: FIR=0 FIN=0 seq=6  payload...
+Frame3: FIR=0 FIN=1 seq=7  payload...
+Assembler: Empty → Running → Running → Complete → app.parse
+```
+
+---
+
+## Comparison to the three libraries
+
+| Strategy | rodbus | dnp3 | libIEC61850 |
+|----------|--------|------|-------------|
+| Incremental frame finite-state machine | Yes | Yes | Yes (Transport Packet, etc.) |
+| Length prefix | Modbus Application Protocol | Header length fields inside link | Transport Packet length |
+| Sync + cyclic redundancy check | Remote Terminal Unit crc; no DNP sync | Core link design | Not the MMS path |
+| Function length tables | Remote Terminal Unit | No (object headers instead) | No |
+| Transport first/final | No | Yes | Segmentation differs (Connection-Oriented Transport Protocol) |
+| Zero-copy cursors | Yes | Yes | Manual buffer walks; MMS often tree-allocates |
+| Schema Basic Encoding Rules | No | No | Yes (MMS) + hand BER (goose/…) |
+
+---
+
+## Choosing for *your* next stack (checklist)
+
+1. What medium? (serial / Transmission Control Protocol / User Datagram Protocol / Ethernet multicast)
+2. Does the standard define sync, length, both, or silence?
+3. Can application messages span frames?
+4. Is the function/object catalog closed or huge?
+5. Hostile or friendly network?
+6. Do handlers need zero-copy or long-lived owned data?
+
+Write the answers down, then pick from the catalog above. If you pick two strategies for two media (as **rodbus** does), share the application codec and isolate the coat.
 
 ## Self-check
 
-1. Why must length fields be clamped?
-2. When is fail-soft resync better than closing the socket?
-3. Why does zero-copy parsing complicate language bindings?
+1. Why is length-prefix alone a poor fit for noisy serial?
+2. When are function-code length tables better than silence detection?
+3. Why keep transport assembly out of the application object decoder?
+4. When should a translator **copy** instead of zero-copy?
 
 
 
@@ -1207,15 +1305,231 @@ Map all of these into **your** translator’s error taxonomy: `TransportFault`, 
 ---
 
 
-# Chapter 10 — Blueprint for a Protocol Translation Service
+# Chapter 10 — Canonical Core and the Translation Service Blueprint
 
-This is the architecture you can take to a design review.
+This chapter explains **what a canonical core is**, **why serious translators prefer one**, and then gives the architecture you can take to a design review.
 
-## Purpose statement
+## What “canonical core” means
 
-> Accept data and commands from protocol A, normalize them into a canonical process model, apply policy, and emit protocol B — with clear ownership of framing, sessions, time, and quality.
+**Canonical** here means: *one agreed internal representation of process truth*, independent of any single wire protocol.
 
-## Reference architecture
+The **canonical core** is the middle of a protocol translation service:
+
+```
+Protocol A stack  →  Canonical core  →  Protocol B stack
+   (bytes in)         (meaning)           (bytes out)
+```
+
+It is **not**:
+
+- a shared socket buffer
+- a pile of `if protocol == Modbus` switches inside a Distributed Network Protocol 3 encoder
+- a raw byte forwarder (“whatever came in goes out”)
+
+It **is**:
+
+- a **point / tag store** (current values)
+- an optional **event / change queue**
+- a **command bus** (writes, selects, operates)
+- a **mapping table** (wire address ↔ stable identifier ↔ other wire address)
+- **policy** (scale, clamp, deadband, authorize, rate limit)
+- a **clock / time policy** (whose timestamp is on this value?)
+
+Think of it as the product’s **process image** plus the **rules for changing it**. Protocol stacks are adapters that speak foreign languages into that image.
+
+---
+
+## Why a canonical core is preferred (and often required)
+
+### 1. Combinatorial explosion without one
+
+With **N** protocols and no core, people build pairwise bridges:
+
+```
+bridges needed ≈ N × (N − 1)   # directed A→B and B→A each count
+```
+
+| Protocols | Pairwise directed bridges | With canonical core (adapters) |
+|-----------|---------------------------|--------------------------------|
+| 2 | 2 | 2 |
+| 3 | 6 | 3 |
+| 4 | 12 | 4 |
+| 6 | 30 | 6 |
+
+Each pairwise bridge re-implements scaling, quality handling, and control semantics. A core turns the problem into **N adapters + one model**.
+
+### 2. Meaning survives protocol quirks
+
+| Concern | Without core (byte/path bridging) | With canonical core |
+|---------|-----------------------------------|---------------------|
+| Modbus has no quality bits | You invent nothing or invent silently | Explicit default quality + documentation |
+| Distributed Network Protocol 3 event classes | Hard-coded into Modbus poll logic | Mapped to event priority in the core |
+| IEC 61850 semantic paths | Flattened to register numbers too early | Stable identifiers retain path metadata |
+| Endianness / scaling | Duplicated in every bridge | One policy module |
+
+The core is where you decide **product behavior**. Stacks only encode/decode.
+
+### 3. Testability
+
+You can unit-test:
+
+- mapping lookups
+- deadbands
+- select-before-operate policy
+- queue shed behavior
+
+…with **fake ingress/egress adapters** and no sockets. Pairwise bridges usually need two live stacks to test anything.
+
+### 4. Operational clarity
+
+On-call questions become answerable:
+
+- “What is the canonical value of `breaker_1.position` right now?”
+- “Which southbound session last updated it?”
+- “Did northbound fail to send, or did southbound never update?”
+
+Without a core, truth is smeared across wire captures.
+
+### 5. Evolution
+
+Adding protocol C means writing **one** new adapter against the existing model — not rewriting A↔B. Replacing a Modbus library should not require rewriting your Distributed Network Protocol 3 encoder.
+
+### 6. Safety and authorization
+
+Authorize **once** against canonical identifiers and roles, after decode and before side effects. Doing auth inside each stack duplicates policy and drifts.
+
+---
+
+## When a thin bridge might be acceptable
+
+A full core is **preferred** for products. A thin bridge can be acceptable when:
+
+| Situation | Why a thin bridge might pass |
+|-----------|------------------------------|
+| Temporary lab shim | Disposable; not shipped |
+| Identical protocol both sides (proxy/filter) | Same semantics; still isolate framing for security |
+| One-off vendor tool with two fixed endpoints | Cost of a model exceeds lifetime of the tool |
+
+Even then, keep **framing isolated**. Never share mutable frame buffers across “sides.”
+
+If the tool might grow a third protocol, build the core on day one — retrofits are expensive.
+
+---
+
+## What belongs in the core versus the stacks
+
+| Belongs in stack adapters | Belongs in canonical core |
+|---------------------------|---------------------------|
+| Sync hunt, cyclic redundancy check, length clamp | Stable point identifiers |
+| Session actors, reconnect, transaction identifiers | Current value, quality, time |
+| Function-code / object encode-decode | Mapping configuration |
+| Protocol-specific control state machines (arming on the wire) | Product-level interlocks and who may write |
+| Per-layer decode logs for that protocol | Cross-hop correlation tokens and metrics |
+
+**Gray area:** select-before-operate. The **wire** state machine lives in the Distributed Network Protocol 3 / IEC adapter; the **product policy** (“northbound select maps to southbound direct write”) lives in the core and must be documented.
+
+---
+
+## Canonical model (minimum viable)
+
+### Point / measurement record
+
+| Field | Why it exists |
+|-------|----------------|
+| Stable identifier | Survives register renumbering and site rewiring |
+| Value + type | Boolean, integer, float, double, bitstring, … |
+| Quality | Good / invalid / overflow / restart / operator-blocked / … |
+| Timestamp + time quality | Device time vs translator receive time — **label which** |
+| Change counter or event id | Deduplicate; detect missed events |
+| Origin | Which session/adapter produced the update |
+| Optional semantic metadata | IEC path, engineering units, description |
+
+### Command record
+
+| Field | Why |
+|-------|-----|
+| Target identifier | Mapping lookup |
+| Command type | Select, operate, cancel, direct operate, write register, … |
+| Value / trip-close / setpoint | |
+| Timeout / policy flags | |
+| Correlation token | Reply to the northbound caller |
+| Requester identity | Authorization and audit |
+
+### Mapping entry (configuration, not code)
+
+```text
+canonical: breaker_1.position
+  from_modbus: unit=3; address=10001; type=coil; invert=false
+  to_dnp3: index=12; class=1; static_group=1; variation=2
+  policy: write_auth=operators; deadband=n/a; scale=1; offset=0
+```
+
+Version the mapping schema. Prefer reload without restarting framers.
+
+---
+
+## How data moves through the core
+
+### Measurement ingress (field → center)
+
+```
+southbound frame ok
+  → application decode (protocol types)
+  → map to canonical id
+  → policy (scale / clamp / deadband)
+  → update point store
+  → enqueue event (if changed / if class warrants)
+  → northbound encoder
+  → send
+```
+
+**Critical rule:** do not block the southbound session actor on a slow northbound socket. Use a **bounded queue**. When full, choose explicitly: drop oldest, drop newest, or shed by priority — and **count it**.
+
+**Quality rule:** never upgrade “invalid” to “good.” If Modbus has no quality, set an explicit `Quality::AssumedGood` (or similar) so operators know it was synthesized.
+
+### Command egress (center → field)
+
+```
+northbound command
+  → authorize against canonical id + role
+  → map to southbound address + command shape
+  → southbound select/operate or write
+  → wait result / timeout
+  → northbound acknowledge or negative acknowledge
+```
+
+Document whether a Distributed Network Protocol 3 select-before-operate collapses to a single Modbus write (common, but a **policy choice**, not an accident).
+
+---
+
+## Mental model: adapters around a database
+
+```
+┌─────────────┐   ┌──────────────────────┐   ┌─────────────┐
+│ Adapter A   │   │ Canonical core       │   │ Adapter B   │
+│ (rodbus-    │◄─►│  store · map · policy│◄─►│ (dnp3-like) │
+│  shaped)    │   │  queues · clock      │   │             │
+└─────────────┘   └──────────────────────┘   └─────────────┘
+```
+
+This matches how **libIEC61850** treats the live model tree as the database, and how **dnp3** outstations treat the point database as truth. Your translator’s core is the same idea elevated to **multi-protocol** scope.
+
+---
+
+## Anti-patterns (canonical core edition)
+
+| Anti-pattern | What goes wrong |
+|--------------|-----------------|
+| Pairwise byte bridge | Unmaintainable special cases; N² growth |
+| Storing wire borrows in the point store | Use-after-free / torn reads when buffers reuse |
+| Blocking southbound on northbound | Field timeouts cascade; reconnect storms |
+| Silent mapping misses | “Works in lab,” empty in production |
+| Auth only on one adapter | Bypass via the other protocol |
+| Inventing Good quality | Misleading operators and automation |
+
+---
+
+## Reference architecture (full service)
 
 ```
                  ┌─────────────────────────────────────────────┐
@@ -1237,75 +1551,16 @@ This is the architecture you can take to a design review.
                  └─────────────────────────────────────────────┘
 ```
 
-**Southbound** often faces field devices. **Northbound** often faces a control center or another bus. Either direction can originate commands; draw arrows for *your* product.
-
-## Canonical model (minimum viable)
-
-Each point record should carry:
-
-| Field | Why |
-|-------|-----|
-| Stable identifier | Survives protocol renumbering |
-| Value + type | Boolean, integer, float, double, bitstring, … |
-| Quality | Good / invalid / overflow / restart / … |
-| Timestamp | Device time versus translator receive time — label which |
-| Change counter or event id | Deduplicate |
-| Origin | Which southbound session produced it |
-
-Commands need:
-
-| Field | Why |
-|-------|-----|
-| Target identifier | Mapping lookup |
-| Command type | Select, operate, direct operate, write register, … |
-| Value / trip-close | |
-| Timeout / interlock policy | |
-| Correlation token | Reply to northbound |
-
-## Mapping configuration
-
-Keep mapping **data-driven** (files or database), not hard-coded:
-
-```text
-canonical: breaker_1.position
-  from_modbus: unit=3; reg=10001; type=coil; invert=false
-  to_dnp3: index=12; class=1; static_group=1; variation=2
-  policy: write_auth=operators; deadband=n/a
-```
-
-Reload mapping without restarting framers when possible; version the mapping schema.
-
-## Data flow — measurement ingress
-
-```
-frame ok → app decode → map to canonical id → policy (scale/clamp)
-  → update point store → enqueue event → northbound encoder → send
-```
-
-Rules:
-
-- Never block the southbound session actor on northbound Transmission Control Protocol slowdowns — use a bounded queue and drop/shed with metrics if full (choose policy explicitly).
-- Preserve quality; do not invent “good” when the source said “invalid.”
-
-## Data flow — command egress
-
-```
-northbound command → authorize → map to southbound address
-  → southbound select/operate or write → wait result → northbound ack/nak
-```
-
-For Distributed Network Protocol 3 / IEC 61850 controls, honor **select-before-operate** state machines. Do not collapse them into a single write unless the product requirements say direct-operate only.
+**Southbound** often faces field devices. **Northbound** often faces a control center. Either direction can originate commands.
 
 ## Process and threading
 
 Recommended production shape (inspired by the Rust stacks):
 
-1. One session actor per southbound channel
-2. One session actor per northbound channel
-3. One core worker (or lock-free queues into a core) for mapping/policy
-4. Supervisors for reconnect
-
-Alternatively, a single-threaded event loop is fine at modest rates if every codec is non-blocking.
+1. One session actor per southbound channel  
+2. One session actor per northbound channel  
+3. Core updated via channels/queues (or a single-threaded loop at modest rates)  
+4. Supervisors for reconnect  
 
 ## Bounded resources checklist
 
@@ -1319,44 +1574,33 @@ Alternatively, a single-threaded event loop is fine at modest rates if every cod
 
 ## Observability
 
-Copy the three libraries’ idea: **decode levels per layer**. Add:
-
-- counters: frames ok/bad, timeouts, queue depth, mapping misses
-- traces: correlation token across the hop
-- a “last value” debug view of the canonical store
+- Per-protocol decode levels (as in **rodbus** / **dnp3**)
+- Canonical “last value” debug view
+- Counters: mapping misses, queue depth, shed events, timeouts
+- Traces keyed by correlation token across the hop
 
 ## Security
 
-- Terminate Transport Layer Security at the physical adapter
-- Authorize **after** decode, **before** side effects (as rodbus role checks do)
-- Treat mapping edits as privileged configuration
-- Do not log secret material from secure sessions
+- Terminate Transport Layer Security at the physical adapter  
+- Authorize after decode, before side effects  
+- Treat mapping edits as privileged configuration  
 
 ## Incremental delivery plan
 
-1. Canonical store + fake ingress/egress adapters (no real protocols)
-2. Southbound Modbus only → store
-3. Northbound Distributed Network Protocol 3 only ← store
-4. Commands both ways
-5. Quality/time hardening
-6. Second southbound protocol
-7. Chaos tests (partial frames, reconnect storms, queue fill)
-
-## Anti-patterns specific to translators
-
-| Anti-pattern | Result |
-|--------------|--------|
-| Point-to-point byte bridging | Unmaintainable special cases |
-| Blocking southbound on northbound | Field timeouts cascade |
-| Silent mapping misses | “It works in the lab” |
-| One shared mutable socket across protocols | Corruption |
-| Collapsing select-before-operate | Unsafe controls |
+1. Canonical store + fake adapters (no real protocols)  
+2. Southbound Modbus → store  
+3. Northbound Distributed Network Protocol 3 ← store  
+4. Commands both ways + documented control policy  
+5. Quality/time hardening  
+6. Second southbound protocol  
+7. Chaos tests (partial frames, reconnect storms, queue fill)  
 
 ## Self-check
 
-1. What four fields belong on every canonical point?
-2. Where do you authorize writes?
-3. What happens when the northbound queue is full? (You must have an answer.)
+1. How many adapters do you need for 5 protocols with a canonical core versus pairwise bridges?  
+2. Name three fields every canonical point should carry besides the raw value.  
+3. Why is blocking southbound on northbound Transmission Control Protocol back-pressure dangerous?  
+4. When is a thin bridge acceptable, and what must you still isolate?
 
 
 

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Generate self-contained protocol-stack course HTML with inline SVG animations."""
 from pathlib import Path
+import walkthroughs
 
 OUT = Path(__file__).resolve().parent / "html" / "index.html"
 OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +115,8 @@ pre {
 }
 .controls button:hover { border-color: var(--accent); }
 .paused .anim { animation-play-state: paused !important; }
+ul.tight li { margin: 0.25rem 0; }
+""" + walkthroughs.EXTRA_CSS + r"""
 ul.tight li { margin: 0.25rem 0; }
 .footer {
   margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line);
@@ -491,7 +494,7 @@ JS = r"""
     });
   });
 })();
-"""
+""" + "\n" + walkthroughs.EXTRA_JS + "\n"
 
 def chapter(cid, title, body):
     return f'<section class="chapter" id="{cid}">\n<h2>{title}</h2>\n{body}\n</section>\n'
@@ -542,17 +545,26 @@ Product application programming interface</pre>
 '''))
 
 chapters_html.append(chapter("ch4", "4 — Parsing strategies", f'''
-{svg_fsm()}
+<p class="lead">Framing turns a byte stream into messages. Below: which strategy to pick, then an interactive step-by-step lab you can click through offline.</p>
+
 <table>
-<tr><th>Mechanism</th><th>Use when</th><th>Trade-off</th></tr>
-<tr><td>Incremental state machine</td><td>Streams, partial reads</td><td>More states to audit</td></tr>
-<tr><td>Length-prefixed header</td><td>Modbus Application Protocol on Transmission Control Protocol</td><td>Must clamp length</td></tr>
-<tr><td>Sync + cyclic redundancy check</td><td>Serial / DNP3 link</td><td>False sync possible; checksum saves you</td></tr>
-<tr><td>Function-code length tables</td><td>Modbus Remote Terminal Unit</td><td>Unknown functions cannot delimit</td></tr>
-<tr><td>Zero-copy cursors</td><td>High-rate measurement lists</td><td>Lifetimes; copy at language boundaries</td></tr>
-<tr><td>Abstract Syntax Notation codecs</td><td>Huge Manufacturing Message Specification catalogs</td><td>Bulk + dual hand/generated paths</td></tr>
+<tr><th>Strategy</th><th>Best for</th><th>Worse for</th></tr>
+<tr><td>Length-prefixed finite-state machine</td><td>Modbus Application Protocol on Transmission Control Protocol</td><td>Noisy serial alone; unclamped lengths</td></tr>
+<tr><td>Sync hunt + cyclic redundancy check</td><td>Serial / Distributed Network Protocol 3 link</td><td>When a pure length header already delimits (unless standard requires sync)</td></tr>
+<tr><td>Function-code length tables</td><td>Closed Modbus Remote Terminal Unit layouts</td><td>Unknown / vendor function codes</td></tr>
+<tr><td>Idle-line silence</td><td>Hardware idle detect</td><td>Jittery software async runtimes</td></tr>
+<tr><td>Transport first/final assembly</td><td>Segmented application messages (DNP3)</td><td>Protocols that never segment</td></tr>
+<tr><td>Zero-copy cursors</td><td>High-rate same-language handlers</td><td>Long-lived stores / language bindings (copy instead)</td></tr>
+<tr><td>Schema Basic Encoding Rules</td><td>Huge Manufacturing Message Specification catalogs</td><td>Tiny flash + ultra-hot multicast without trimming</td></tr>
+<tr><td>Parser combinators</td><td>Prototypes</td><td>Certified industrial hot paths (these stacks avoid them)</td></tr>
 </table>
-<div class="callout">Reference loop: <code>parse(buffer)</code> → None means read more; Some(frame) returns; Err resets parser. Keep parse pure relative to the socket so unit tests feed byte slices.</div>
+
+{svg_fsm()}
+
+<h3>Interactive parse lab</h3>
+{walkthroughs.walkthroughs_html()}
+
+<div class="callout">Full narrative, decision matrix, and worked micro-examples: Markdown <code>chapters/04-parsing.md</code>.</div>
 '''))
 
 chapters_html.append(chapter("ch5", "5 — Sessions and correlation", f'''
@@ -610,16 +622,48 @@ chapters_html.append(chapter("ch9", "9 — Compare and contrast", f'''
 </table>
 '''))
 
-chapters_html.append(chapter("ch10", "10 — Translation service blueprint", f'''
+chapters_html.append(chapter("ch10", "10 — Canonical core & translation blueprint", f'''
+<p class="lead">A <strong>canonical core</strong> is one agreed internal representation of process truth — independent of any single wire protocol. Protocol stacks are adapters; the core is the product’s process image plus the rules for changing it.</p>
+
 {svg_translator()}
-<ol>
-<li>Define canonical points: id, value, quality, time, origin.</li>
-<li>Data-driven mapping files (versioned).</li>
-<li>Bounded event queues with an explicit shed policy.</li>
-<li>Authorize after decode, before side effects.</li>
-<li>Honor select-before-operate when either peer requires it.</li>
-<li>Deliver incrementally: fake adapters → one southbound → one northbound → commands → chaos tests.</li>
-</ol>
+
+<div class="grid2">
+  <div class="card">
+    <h3>Why prefer a core</h3>
+    <ul class="tight">
+      <li><strong>Avoid N² bridges</strong> — 6 protocols need 6 adapters with a core, but 30 pairwise directed bridges without one</li>
+      <li><strong>Meaning survives quirks</strong> — quality, time, scaling live once</li>
+      <li><strong>Test without sockets</strong> — fake adapters against the store</li>
+      <li><strong>Authorize once</strong> — after decode, before side effects</li>
+      <li><strong>Evolve</strong> — add protocol C without rewriting A↔B</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>What the core holds</h3>
+    <ul class="tight">
+      <li>Point store (value, quality, time, origin)</li>
+      <li>Event / change queue (bounded)</li>
+      <li>Command bus + correlation tokens</li>
+      <li>Mapping table (data-driven)</li>
+      <li>Policy (scale, deadband, auth)</li>
+      <li>Clock / time-source labels</li>
+    </ul>
+  </div>
+</div>
+
+<div class="warnbox"><strong>Not a core:</strong> shared socket buffers, pairwise byte tunnels, or <code>if protocol==Modbus</code> switches inside another protocol’s encoder. <strong>Thin bridges</strong> are only for disposable lab shims or same-protocol proxies — still isolate framing.</div>
+
+<table>
+<tr><th>In adapters (stacks)</th><th>In canonical core</th></tr>
+<tr><td>Sync, checksums, session actors, transaction ids</td><td>Stable identifiers, quality, mapping, product interlocks</td></tr>
+<tr><td>Wire select-before-operate state</td><td>Policy: how northbound arming maps to southbound writes</td></tr>
+<tr><td>Per-protocol decode logs</td><td>Cross-hop metrics and “last value” views</td></tr>
+</table>
+
+<pre>southbound decode → map → policy → point store → event queue → northbound encode
+northbound command → authorize → map → southbound write/select-operate → ack</pre>
+
+<div class="callout">Never block southbound on northbound back-pressure — bounded queues with an explicit shed policy. Never upgrade invalid quality to good. Full deep-dive: Markdown <code>chapters/10-translation-service.md</code>.</div>
 '''))
 
 chapters_html.append(chapter("ch11", "11 — Trade-offs and checklist", f'''
@@ -655,7 +699,7 @@ chapters_html.append(chapter("glossary", "Glossary", '''
 <table>
 <tr><th>Term</th><th>Definition</th></tr>
 <tr><td>Application Data Unit</td><td>Framed packet including addressing fields around a protocol data unit</td></tr>
-<tr><td>Canonical model</td><td>Translator internal process representation</td></tr>
+<tr><td>Canonical model / core</td><td>Translator’s internal process representation (point store, mapping, policy) independent of any single wire protocol</td></tr>
 <tr><td>Cyclic redundancy check</td><td>Checksum detecting corruption</td></tr>
 <tr><td>Fail closed / fail soft</td><td>Abort session versus resynchronize after bad frames</td></tr>
 <tr><td>Session actor</td><td>Task or thread that owns protocol state and input/output</td></tr>
@@ -675,7 +719,7 @@ nav = '''
   <a href="#ch1">1. Why stacks exist</a>
   <a href="#ch2">2. Mental models</a>
   <a href="#ch3">3. Layering</a>
-  <a href="#ch4">4. Parsing</a>
+  <a href="#ch4">4. Parsing + lab</a>
   <a href="#ch5">5. Sessions</a>
   <div class="group">Case studies</div>
   <a href="#ch6">6. Modbus / rodbus</a>
@@ -683,7 +727,7 @@ nav = '''
   <a href="#ch8">8. IEC 61850</a>
   <div class="group">Design</div>
   <a href="#ch9">9. Compare</a>
-  <a href="#ch10">10. Translator blueprint</a>
+  <a href="#ch10">10. Canonical core</a>
   <a href="#ch11">11. Trade-offs</a>
   <a href="#ch12">12. Exercises</a>
   <a href="#glossary">Glossary</a>
